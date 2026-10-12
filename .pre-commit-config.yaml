@@ -1,0 +1,10 @@
+# Quét secret trước mỗi commit bằng Gitleaks đã cài sẵn trong PATH
+# (`gitleaks version` phải in 8.30.1). Hook `gitleaks-system` lấy từ repo
+# chính thức và pin đúng tag, không build Go trong giờ lab.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks-system
+        args: ["--config", ".gitleaks.toml"]
+        pass_filenames: false

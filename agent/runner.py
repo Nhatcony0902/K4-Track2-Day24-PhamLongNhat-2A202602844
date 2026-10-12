@@ -59,16 +59,162 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, pii, tools
+from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+
+AGENT_ID = "lab24-agent"
+RUN_TTL = timedelta(minutes=5)
+# Quyền tối đa của orchestrator (agent cha). Run A/B là agent con ở depth 1,
+# nên quyền hiệu lực của chúng còn bị giao thêm với tập này.
+ORCHESTRATOR_SCOPES = ("search_docs", "read_customer", "http_post")
+# Run A chỉ được chạm untrusted content; Run B chỉ được chạm private data
+# (http_post nằm trong scope để PEP — không phải runner — quyết định deny).
+RUN_A_SCOPES = ("search_docs",)
+RUN_B_SCOPES = ("read_customer", "http_post")
+DEFAULT_EGRESS_URL = "http://127.0.0.1:10024/reconcile"
+
+_TICKET_FILE_RE = re.compile(r"^ticket-(\d+)[a-z]?\.md$")
 
 
 class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+@dataclass(frozen=True)
+class RunAOutput:
+    """Thứ DUY NHẤT đi qua boundary A -> B: dữ liệu typed, không có free text."""
+    ticket_ids: tuple[int, ...] = ()
+    egress_requested: bool = False
+
+
+@dataclass
+class _Session:
+    principal_id: str
+    ledger_path: Path
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    expires_at: str = field(default_factory=lambda: (
+        datetime.now(timezone.utc) + RUN_TTL).isoformat(timespec="seconds"))
+
+
+def _args_hash(args: dict) -> str:
+    canonical = json.dumps(args, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _guarded_call(session: _Session, run: str, scopes: tuple[str, ...], tool: str,
+                  args: dict, classification: str, purpose: str, egress: bool,
+                  call):
+    """PEP: policy.check() -> ledger.append() -> chỉ khi allow mới gọi tool."""
+    agent_owner = f"{AGENT_ID}/run-{run}"
+    context = PolicyContext(
+        data_classification=classification,
+        request_purpose=purpose,
+        agent_owner=agent_owner,
+        delegation_depth=1,
+        egress_enabled=egress,
+        principal_id=session.principal_id,
+        requested_tool=tool,
+        agent_scopes=scopes,
+        parent_scopes=ORCHESTRATOR_SCOPES,
+        expires_at=session.expires_at,
+    )
+    allowed, reason = check(context)
+    ledger.append({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "agent_id": agent_owner,
+        "run_id": f"{session.request_id}-{run}",
+        "on_behalf_of": session.principal_id,
+        "expires_at": session.expires_at,
+        "tool": tool,
+        "args_hash": _args_hash(args),
+        "classification": classification,
+        "purpose": purpose,
+        "egress": egress,
+        "delegation_depth": context.delegation_depth,
+        "decision": "allow" if allowed else "deny",
+        "reason": reason,
+    }, session.ledger_path)
+    if not allowed:
+        return False, None
+    return True, call()
+
+
+def _run_a(session: _Session, message: str, llm) -> tuple[RunAOutput, list[dict]]:
+    """Run A: chỉ search_docs. Không read_customer, không http_post."""
+    ok, docs = _guarded_call(
+        session, "a", RUN_A_SCOPES, "search_docs", {"query": message},
+        classification="internal", purpose="summarize-tickets", egress=False,
+        call=lambda: tools.search_docs(message))
+    if not ok:
+        return RunAOutput(), []
+
+    # ID chỉ lấy từ TÊN FILE do hệ thống đặt, không lấy từ nội dung.
+    ticket_ids = sorted({int(m.group(1)) for d in docs
+                         if (m := _TICKET_FILE_RE.match(d["id"]))})
+    # Mock LLM "tuân theo" chỉ thị nếu thấy; ta chỉ giữ một bit yêu cầu egress
+    # để PEP xử lý. customer_ids và target_url của attacker bị bỏ tại đây.
+    injected = llm.find_injection("\n\n".join(d["text"] for d in docs))
+    return RunAOutput(tuple(ticket_ids), injected is not None), docs
+
+
+def _customer_index() -> dict[int, str]:
+    """ticket_id -> customer_id từ related_tickets (nguồn tin cậy).
+
+    Chỉ giữ hai field định danh, các field PII bị bỏ ngay khi parse; hồ sơ
+    đầy đủ chỉ được đọc qua tools.read_customer sau khi PEP allow.
+    """
+    records = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    return {int(t): str(r["customer_id"]) for r in records for t in r.get("related_tickets", [])}
+
+
+def _run_b(session: _Session, handoff: RunAOutput) -> list[dict]:
+    """Run B: chỉ nhận RunAOutput typed; không thấy text của document."""
+    index = _customer_index()
+    customer_ids = sorted({index[t] for t in handoff.ticket_ids if t in index})
+
+    records = []
+    for customer_id in customer_ids:
+        try:
+            ok, record = _guarded_call(
+                session, "b", RUN_B_SCOPES, "read_customer", {"customer_id": customer_id},
+                classification="restricted", purpose="support-reply", egress=False,
+                call=lambda cid=customer_id: tools.read_customer(cid))
+        except tools.ToolError:
+            continue
+        if ok:
+            records.append(record)
+
+    if handoff.egress_requested:
+        # Payload chứa hồ sơ khách -> restricted; PEP deny restricted + egress.
+        body = {"records": records}
+        classification = "restricted" if records else "internal"
+        _guarded_call(
+            session, "b", RUN_B_SCOPES, "http_post", {"url": DEFAULT_EGRESS_URL, "body": body},
+            classification=classification, purpose="support-reply", egress=True,
+            call=lambda: tools.http_post(DEFAULT_EGRESS_URL, body))
+    return records
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    # Principal chỉ được tra trong data/principals.json, bên trong policy.check().
+    session = _Session(principal_id=principal_id, ledger_path=ledger_path)
+
+    handoff, docs = _run_a(session, message, llm)
+    _run_b(session, handoff)
+
+    # Text quay lại người dùng/LLM cũng qua PII gate.
+    safe_docs = [{"id": d["id"], "text": pii.redact(d["text"])} for d in docs]
+    return llm.summarize(safe_docs)

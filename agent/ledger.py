@@ -37,12 +37,62 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
+
+GENESIS_HASH = "0" * 64
+REQUIRED_FIELDS = ("ts", "agent_id", "run_id", "tool", "args_hash",
+                   "classification", "decision", "reason")
+
+
+def _digest(record: dict) -> str:
+    body = {k: v for k, v in record.items() if k != "hash"}
+    canonical = json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _last_hash(path: Path) -> str:
+    if not path.exists():
+        return GENESIS_HASH
+    last = None
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                last = line
+    return json.loads(last)["hash"] if last else GENESIS_HASH
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    missing = [k for k in REQUIRED_FIELDS if k not in entry]
+    if missing:
+        raise ValueError(f"ledger entry thiếu field: {', '.join(missing)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {k: v for k, v in entry.items() if k not in ("prev_hash", "hash")}
+    record["prev_hash"] = _last_hash(path)
+    record["hash"] = _digest(record)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    if not path.exists():
+        return False
+    prev = GENESIS_HASH
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return False
+            if not str(record.get("reason") or "").strip():
+                return False
+            if record.get("prev_hash") != prev:
+                return False
+            if record.get("hash") != _digest(record):
+                return False
+            prev = record["hash"]
+    return True

@@ -1,5 +1,7 @@
-# Baseline — điền trong checkpoint 1
+# Baseline: checkpoint 1
 
-1. Agent có identity mỗi run chưa? Dẫn file/hàm:
-2. Ai cho phép `http_post`? Dẫn file/hàm:
-3. Nếu gửi sai PII ra sink, bằng chứng ở đâu? Dẫn file/hàm:
+Đọc `agent/loop.py::_naive_loop()` (dòng 27–54), là đường chạy khi `agent/runner.py` còn là stub `RunnerScaffoldPending` (`agent/loop.py:67-74`).
+
+1. **Agent có identity mỗi run chưa?** Chưa. `_naive_loop(message, llm)` (`agent/loop.py:27`) không nhận và không sinh `run_id`, `agent_id` hay principal. Cờ `--as` được parse ở `agent/loop.py:83` và truyền vào `run_once(..., principal_id=...)` (`agent/loop.py:57-58`), nhưng nhánh baseline gọi `_naive_loop(message, llm)` ở `agent/loop.py:73` và bỏ `principal_id`. Mọi lần chạy đều như nhau, bất kể ai ra lệnh.
+2. **Ai cho phép `http_post`?** Không ai cả. `tools.http_post(injected.target_url, ...)` ở `agent/loop.py:44` chạy ngay khi `llm.find_injection()` (`agent/loop.py:34`) thấy chỉ thị trong text của `search_docs`, tức là chính **nội dung tài liệu do attacker viết** quyết định việc gọi tool. Không có PEP/`policy.check()` trước lời gọi. Lớp chặn duy nhất là allowlist cứng `127.0.0.1:10024` trong `agent/tools.py:76-83`. Lớp đó chỉ giữ cho lab an toàn, không phải control: sink vẫn nhận được dữ liệu. `customer_id` cũng lấy thẳng từ free text (`injected.customer_ids`, `agent/loop.py:37-39`).
+3. **Bằng chứng đã gửi sai dữ liệu ở đâu?** Phía agent không có bằng chứng nào: `_naive_loop` không ghi ledger, không log tool call. Bằng chứng duy nhất nằm ở **phía nhận**: `sink/sink.py::make_handler.do_POST` (`sink/sink.py:42-50`) ghi body vào `reports/sink.log`. Bản sao `reports/attack-before.log` chứa hồ sơ synthetic đầy đủ của `KH-000999` (CCCD, SĐT, STK, email) POST tới `/reconcile`. Trong thực tế, một bên ngoài sẽ không cho mình đọc log của họ, nên baseline không có audit trail.
